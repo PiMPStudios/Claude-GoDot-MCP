@@ -437,7 +437,7 @@ func _scan_assets_recursive(path: String, asset_type: String, assets: Array) -> 
 							"path": full_path,
 							"name": file_name,
 							"extension": extension,
-							"size": FileAccess.get_file_as_bytes(full_path).size() if FileAccess.file_exists(full_path) else 0
+							"size": _get_file_size(full_path) if FileAccess.file_exists(full_path) else 0
 						})
 			
 			file_name = dir.get_next()
@@ -527,7 +527,7 @@ func get_asset_info(asset_path: String) -> Dictionary:
 	}
 	
 	if FileAccess.file_exists(asset_path):
-		info["size"] = FileAccess.get_file_as_bytes(asset_path).size()
+		info["size"] = _get_file_size(asset_path)
 		info["modified_time"] = FileAccess.get_modified_time(asset_path)
 	
 	if ResourceLoader.exists(asset_path):
@@ -547,3 +547,13 @@ func get_asset_info(asset_path: String) -> Dictionary:
 				info["node_count"] = state.get_node_count()
 	
 	return info
+
+
+func _get_file_size(path: String) -> int:
+	"""Return file size in bytes without loading the entire file into memory."""
+	var f = FileAccess.open(path, FileAccess.READ)
+	if not f:
+		return 0
+	var size = f.get_length()
+	f.close()
+	return size

@@ -62,7 +62,7 @@ func _build_directory_tree(path: String, filters: Array, depth: int = 0, max_dep
 					"name": item_name,
 					"path": item_path,
 					"type": _get_file_type(item_name),
-					"size": FileAccess.get_file_as_bytes(item_path).size(),
+					"size": _get_file_size(item_path),
 					"is_dir": false
 				})
 		
@@ -291,7 +291,10 @@ func create_directory(dir_path: String) -> Dictionary:
 	var error = dir.make_dir_recursive(dir_path)
 	if error != OK:
 		return {"success": false, "error": "Failed to create directory: " + error_string(error)}
-	
+
+	if editor_interface:
+		editor_interface.get_resource_filesystem().scan()
+
 	emit_signal("file_system_changed")
 	return {"success": true, "data": {"path": dir_path}}
 
@@ -493,6 +496,66 @@ func _parse_plugin_cfg(cfg_path: String, plugin_dir: String) -> Dictionary:
 	}
 
 	return plugin_info
+
+
+func _get_file_size(path: String) -> int:
+	"""Return file size in bytes without loading the entire file into memory."""
+	var f = FileAccess.open(path, FileAccess.READ)
+	if not f:
+		return 0
+	var size = f.get_length()
+	f.close()
+	return size
+
+
+func write_text_file(file_path: String, content: String) -> Dictionary:
+	"""Write text content to a project file and trigger a filesystem scan so the
+	editor sees the change. Prefer this over writing from the Python process."""
+	if not file_path.begins_with("res://"):
+		file_path = "res://" + file_path
+
+	# Ensure parent directory exists
+	var dir_path = file_path.get_base_dir()
+	if dir_path != "" and dir_path != "res://":
+		var dir = DirAccess.open("res://")
+		if dir and not dir.dir_exists(dir_path):
+			var mk_err = dir.make_dir_recursive(dir_path)
+			if mk_err != OK:
+				return {"success": false, "error": "Failed to create directory: " + error_string(mk_err)}
+
+	var file = FileAccess.open(file_path, FileAccess.WRITE)
+	if not file:
+		return {"success": false, "error": "Failed to write file: " + file_path + " (" + error_string(FileAccess.get_open_error()) + ")"}
+
+	file.store_string(content)
+	file.close()
+
+	if editor_interface:
+		editor_interface.get_resource_filesystem().scan()
+
+	emit_signal("file_system_changed")
+	print("[File Operations] Wrote text file: ", file_path, " (", content.length(), " chars)")
+	return {"success": true, "data": {"path": file_path, "bytes": content.length()}}
+
+
+func update_project_settings_values(settings: Dictionary) -> Dictionary:
+	"""Update ProjectSettings keys and persist via ProjectSettings.save().
+	Keys use Godot ProjectSettings paths (e.g. application/config/name)."""
+	if settings.is_empty():
+		return {"success": false, "error": "No settings provided"}
+
+	var updated: Array = []
+	for key in settings.keys():
+		var key_str = str(key)
+		ProjectSettings.set_setting(key_str, settings[key])
+		updated.append(key_str)
+
+	var err = ProjectSettings.save()
+	if err != OK:
+		return {"success": false, "error": "ProjectSettings.save() failed: " + error_string(err)}
+
+	print("[File Operations] Updated project settings: ", updated)
+	return {"success": true, "data": {"updated": updated}}
 
 
 # ── Import Settings ──────────────────────────────────────────────────────────

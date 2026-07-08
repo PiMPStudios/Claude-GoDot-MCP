@@ -257,6 +257,9 @@ func _setup_http_routes() -> void:
 	http_server.register_route("/api/project/search_files", _handle_search_files)
 	http_server.register_route("/api/project/uid_to_path", _handle_uid_to_project_path)
 	http_server.register_route("/api/project/path_to_uid", _handle_project_path_to_uid)
+	http_server.register_route("/api/project/update_settings", _handle_update_project_settings)
+	http_server.register_route("/api/file/write_text", _handle_write_text_file)
+	http_server.register_route("/api/file/create_directory", _handle_create_directory)
 	
 	# Scene tools
 	http_server.register_route("/api/scene/tree", _handle_get_scene_tree)
@@ -514,6 +517,28 @@ func _handle_project_path_to_uid(params: Dictionary) -> Dictionary:
 	var path = params.get("path", "")
 	var uid = file_operations.project_path_to_uid(path)
 	return {"success": true, "data": {"uid": uid}}
+
+
+func _handle_update_project_settings(params: Dictionary) -> Dictionary:
+	var settings = params.get("settings", {})
+	if typeof(settings) != TYPE_DICTIONARY:
+		return {"success": false, "error": "settings must be a dictionary"}
+	return file_operations.update_project_settings_values(settings)
+
+
+func _handle_write_text_file(params: Dictionary) -> Dictionary:
+	var path = params.get("path", params.get("file_path", ""))
+	var content = params.get("content", "")
+	if path == "":
+		return {"success": false, "error": "path is required"}
+	return file_operations.write_text_file(path, content)
+
+
+func _handle_create_directory(params: Dictionary) -> Dictionary:
+	var dir_path = params.get("dir_path", params.get("path", ""))
+	if dir_path == "":
+		return {"success": false, "error": "dir_path is required"}
+	return file_operations.create_directory(dir_path)
 
 
 # HTTP Route Handlers - Scene Tools

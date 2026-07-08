@@ -112,7 +112,7 @@ func _on_test_pressed() -> void:
 	var port = current_config.get("GDAI_MCP_SERVER_PORT", "3571")
 	print("[MCP Enhanced] Port: " + str(port))
 	
-	var url = "http://127.0.0.1:" + str(port) + "/project_info"
+	var url = "http://127.0.0.1:" + str(port) + "/api/project/info"
 	print("[MCP Enhanced] Test URL: " + url)
 	print("[MCP Enhanced] ")
 	print("[MCP Enhanced] If browser shows 'Connection Refused':")

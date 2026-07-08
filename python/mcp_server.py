@@ -48,6 +48,28 @@ async def resolve_res_path(res_path: str) -> str:
     return res_path.replace("res://", "./")
 
 
+async def to_res_path(path: str) -> str:
+    """Convert an absolute or relative path to res:// when under the Godot project root."""
+    global _godot_project_path
+    if not path:
+        return path
+    if path.startswith("res://"):
+        return path
+    if _godot_project_path is None:
+        try:
+            result = await call_godot_api("/api/project/info")
+            _godot_project_path = result.get("data", {}).get("project_path", "")
+        except Exception:
+            _godot_project_path = ""
+    if _godot_project_path:
+        root = os.path.realpath(_godot_project_path)
+        full = os.path.realpath(path)
+        if full == root or full.startswith(root + os.sep):
+            rel = os.path.relpath(full, root).replace("\\", "/")
+            return "res://" + rel
+    return path
+
+
 async def call_godot_api(endpoint: str, params: dict = None) -> dict:
     """
     Call Godot HTTP API endpoint with error handling
@@ -69,6 +91,117 @@ async def call_godot_api(endpoint: str, params: dict = None) -> dict:
             "success": False,
             "error": f"Error calling Godot API: {str(e)}"
         }
+
+
+async def notify_godot_filesystem_scan() -> None:
+    """Ask the editor to rescan so externally written files appear. Best-effort."""
+    try:
+        await call_godot_api("/api/qa/reimport_all", {"force_reimport": False})
+    except Exception:
+        pass
+
+
+def _format_project_godot_value(value) -> str:
+    """Serialize a Python value to a project.godot assignment RHS."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return str(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        # Allow callers to pass pre-formatted Godot expressions
+        if (
+            stripped.startswith("PackedStringArray(")
+            or stripped.startswith("Vector")
+            or stripped.startswith("Color(")
+            or (stripped.startswith('"') and stripped.endswith('"'))
+        ):
+            return stripped
+        return json.dumps(value)
+    return json.dumps(str(value))
+
+
+def _update_project_godot_file(settings_file: str, settings: dict) -> list:
+    """Section-aware update of project.godot. Returns list of updated keys.
+
+    ProjectSettings paths like 'application/config/name' map to:
+      [application]
+      config/name="..."
+    """
+    with open(settings_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    # Index sections: section_name -> {header_idx, keys: {file_key: line_idx}}
+    sections: dict = {}
+    current_section = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]") and not stripped.startswith("[/"):
+            current_section = stripped[1:-1]
+            if current_section not in sections:
+                sections[current_section] = {"header_idx": i, "keys": {}}
+            continue
+        if current_section is None or not stripped or stripped.startswith(";") or stripped.startswith("#"):
+            continue
+        if "=" in stripped:
+            file_key = stripped.split("=", 1)[0].strip()
+            sections[current_section]["keys"][file_key] = i
+
+    updated = []
+    # Defer insertions so line indices stay valid while we rewrite existing keys
+    insertions: list[tuple[int, str]] = []  # (insert_after_line, new_line)
+
+    for full_key, value in settings.items():
+        full_key = str(full_key)
+        if "/" not in full_key:
+            # Treat as key under [application] if no section separator
+            section_name, file_key = "application", full_key
+        else:
+            section_name, file_key = full_key.split("/", 1)
+
+        rhs = _format_project_godot_value(value)
+        new_line = f"{file_key}={rhs}\n"
+
+        if section_name in sections and file_key in sections[section_name]["keys"]:
+            idx = sections[section_name]["keys"][file_key]
+            lines[idx] = new_line
+            updated.append(full_key)
+            continue
+
+        if section_name in sections:
+            # Insert after last key in section, or right after header if empty
+            sec = sections[section_name]
+            if sec["keys"]:
+                insert_after = max(sec["keys"].values())
+            else:
+                insert_after = sec["header_idx"]
+            insertions.append((insert_after, new_line))
+            updated.append(full_key)
+            continue
+
+        # Create new section at end of file
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] = lines[-1] + "\n"
+        lines.append("\n")
+        lines.append(f"[{section_name}]\n")
+        new_header_idx = len(lines) - 1
+        lines.append(new_line)
+        sections[section_name] = {
+            "header_idx": new_header_idx,
+            "keys": {file_key: len(lines) - 1},
+        }
+        updated.append(full_key)
+
+    # Apply insertions from bottom to top so indices remain valid
+    for insert_after, new_line in sorted(insertions, key=lambda t: t[0], reverse=True):
+        lines.insert(insert_after + 1, new_line)
+
+    with open(settings_file, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+    return updated
 
 
 # ===== TOOL DEFINITIONS =====
@@ -3053,7 +3186,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
     if name == "check_godot_running":
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
-                response = await client.get(f"{GODOT_BASE_URL}/project_info")
+                response = await client.post(
+                    f"{GODOT_BASE_URL}/api/project/info",
+                    json={},
+                )
                 return [TextContent(
                     type="text",
                     text=json.dumps({
@@ -3062,7 +3198,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                         "responsive": response.status_code == 200
                     }, indent=2)
                 )]
-        except:
+        except Exception:
             return [TextContent(
                 type="text",
                 text=json.dumps({
@@ -3152,7 +3288,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 }, indent=2)
             )]
     
-    # Handle direct file system tools (work without Godot running)
+    # Handle direct file system tools (prefer Godot when running so editor stays in sync)
     if name in ["read_scene_file", "write_scene_file", "read_script_file", "write_script_file",
                 "read_project_settings", "update_project_settings", "create_directory", "list_directory"]:
         
@@ -3180,19 +3316,41 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )]
         
         elif name == "write_scene_file":
-            scene_path = await resolve_res_path(arguments.get("scene_path", ""))
+            raw_path = arguments.get("scene_path", "")
             content = arguments.get("content", "")
-            
+            # Prefer Godot-side write so EditorFileSystem scans the change
+            if str(raw_path).startswith("res://"):
+                res_path = raw_path
+            else:
+                res_path = await to_res_path(raw_path)
+
+            godot_result = await call_godot_api("/api/file/write_text", {
+                "path": res_path if str(res_path).startswith("res://") else raw_path,
+                "content": content,
+            })
+            if godot_result.get("success"):
+                return [TextContent(type="text", text=json.dumps({
+                    "success": True,
+                    "path": godot_result.get("data", {}).get("path", res_path),
+                    "message": "Scene file written via Godot (filesystem scanned)",
+                    "via": "godot",
+                }, indent=2))]
+
+            # Fallback: direct disk write (Godot not running or request failed)
+            scene_path = await resolve_res_path(raw_path)
             try:
                 os.makedirs(os.path.dirname(scene_path) if os.path.dirname(scene_path) else ".", exist_ok=True)
                 with open(scene_path, 'w', encoding='utf-8') as f:
                     f.write(content)
+                await notify_godot_filesystem_scan()
                 return [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": True,
                         "path": scene_path,
-                        "message": "Scene file written successfully"
+                        "message": "Scene file written to disk",
+                        "via": "disk",
+                        "godot_error": godot_result.get("error"),
                     }, indent=2)
                 )]
             except Exception as e:
@@ -3228,19 +3386,39 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )]
         
         elif name == "write_script_file":
-            script_path = await resolve_res_path(arguments.get("script_path", ""))
+            raw_path = arguments.get("script_path", "")
             content = arguments.get("content", "")
-            
+            if str(raw_path).startswith("res://"):
+                res_path = raw_path
+            else:
+                res_path = await to_res_path(raw_path)
+
+            godot_result = await call_godot_api("/api/file/write_text", {
+                "path": res_path if str(res_path).startswith("res://") else raw_path,
+                "content": content,
+            })
+            if godot_result.get("success"):
+                return [TextContent(type="text", text=json.dumps({
+                    "success": True,
+                    "path": godot_result.get("data", {}).get("path", res_path),
+                    "message": "Script file written via Godot (filesystem scanned)",
+                    "via": "godot",
+                }, indent=2))]
+
+            script_path = await resolve_res_path(raw_path)
             try:
                 os.makedirs(os.path.dirname(script_path) if os.path.dirname(script_path) else ".", exist_ok=True)
                 with open(script_path, 'w', encoding='utf-8') as f:
                     f.write(content)
+                await notify_godot_filesystem_scan()
                 return [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": True,
                         "path": script_path,
-                        "message": "Script file written successfully"
+                        "message": "Script file written to disk",
+                        "via": "disk",
+                        "godot_error": godot_result.get("error"),
                     }, indent=2)
                 )]
             except Exception as e:
@@ -3278,31 +3456,32 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         
         elif name == "update_project_settings":
             project_path = arguments.get("project_path", ".")
-            settings = arguments.get("settings", {})
+            settings = arguments.get("settings", {}) or {}
+
+            # Prefer Godot ProjectSettings API when the editor is running
+            godot_result = await call_godot_api("/api/project/update_settings", {
+                "settings": settings,
+            })
+            if godot_result.get("success"):
+                return [TextContent(type="text", text=json.dumps({
+                    "success": True,
+                    "message": "Project settings updated via Godot ProjectSettings.save()",
+                    "via": "godot",
+                    "data": godot_result.get("data", {}),
+                }, indent=2))]
+
+            # Offline fallback: section-aware project.godot edit
             settings_file = os.path.join(project_path, "project.godot")
-            
             try:
-                with open(settings_file, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                
-                for key, value in settings.items():
-                    found = False
-                    for i, line in enumerate(lines):
-                        if line.startswith(key):
-                            lines[i] = f'{key}="{value}"\n'
-                            found = True
-                            break
-                    if not found:
-                        lines.append(f'{key}="{value}"\n')
-                
-                with open(settings_file, 'w', encoding='utf-8') as f:
-                    f.writelines(lines)
-                
+                updated = _update_project_godot_file(settings_file, settings)
                 return [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": True,
-                        "message": "Project settings updated successfully"
+                        "message": "Project settings updated on disk (section-aware)",
+                        "via": "disk",
+                        "updated": updated,
+                        "godot_error": godot_result.get("error"),
                     }, indent=2)
                 )]
             except Exception as e:
@@ -3316,17 +3495,36 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         
         elif name == "create_directory":
             dir_path = arguments.get("dir_path", "")
-            if dir_path.startswith("res://"):
-                dir_path = dir_path.replace("res://", "./")
-            
+
+            # Prefer Godot so the filesystem dock refreshes
+            godot_path = dir_path
+            if not str(dir_path).startswith("res://"):
+                godot_path = await to_res_path(dir_path)
+            godot_result = await call_godot_api("/api/file/create_directory", {
+                "dir_path": godot_path if str(godot_path).startswith("res://") else dir_path,
+            })
+            if godot_result.get("success"):
+                return [TextContent(type="text", text=json.dumps({
+                    "success": True,
+                    "path": godot_result.get("data", {}).get("path", godot_path),
+                    "message": "Directory created via Godot (filesystem scanned)",
+                    "via": "godot",
+                }, indent=2))]
+
+            disk_path = dir_path
+            if str(disk_path).startswith("res://"):
+                disk_path = await resolve_res_path(disk_path)
             try:
-                os.makedirs(dir_path, exist_ok=True)
+                os.makedirs(disk_path, exist_ok=True)
+                await notify_godot_filesystem_scan()
                 return [TextContent(
                     type="text",
                     text=json.dumps({
                         "success": True,
-                        "path": dir_path,
-                        "message": "Directory created successfully"
+                        "path": disk_path,
+                        "message": "Directory created on disk",
+                        "via": "disk",
+                        "godot_error": godot_result.get("error"),
                     }, indent=2)
                 )]
             except Exception as e:
@@ -3343,7 +3541,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
             recursive = arguments.get("recursive", False)
             
             if dir_path.startswith("res://"):
-                dir_path = dir_path.replace("res://", "./")
+                dir_path = await resolve_res_path(dir_path)
             
             try:
                 if recursive:
